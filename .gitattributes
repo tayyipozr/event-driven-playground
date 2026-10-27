@@ -1,0 +1,17 @@
+# Normalize line endings in the repo; let Git pick the checkout style per platform
+* text=auto
+
+# Files executed inside Linux containers MUST keep LF, otherwise bash fails with "\r: command not found"
+*.sh        text eol=lf
+Dockerfile  text eol=lf
+*.properties text eol=lf
+
+# Windows-only files (cmd.exe needs CRLF to parse batch files reliably)
+*.cmd text eol=crlf
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+*.sln text eol=crlf
+
+# Binary
+*.png binary
+*.jpg binary
