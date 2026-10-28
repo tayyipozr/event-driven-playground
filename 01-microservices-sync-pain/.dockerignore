@@ -1,0 +1,9 @@
+**/bin/
+**/obj/
+**/.vs/
+**/*.user
+**/Properties/launchSettings.json
+tests/
+requests/
+README.md
+docker-compose.yml
