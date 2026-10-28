@@ -1,6 +1,8 @@
 using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Http.Resilience;
 using Microsoft.Extensions.Options;
 using OrderService;
+using Polly;
 
 var builder = WebApplication.CreateBuilder(args);
 
@@ -9,13 +11,50 @@ builder.Services.AddDbContext<OrdersDbContext>(options =>
 
 builder.Services.Configure<CheckoutOptions>(builder.Configuration.GetSection("Checkout"));
 
+// Payment normally answers in tens of milliseconds. In production these values come from measured p99 latency.
+var attemptTimeout = TimeSpan.FromSeconds(2);
+// Upper bound for the whole call: 3 attempts x 2 s + backoff delays fits inside it.
+var totalTimeout = TimeSpan.FromSeconds(8);
+
 builder.Services.AddHttpClient<PaymentClient>(client =>
 {
     client.BaseAddress = new Uri(builder.Configuration["PaymentService:BaseUrl"]
         ?? throw new InvalidOperationException("PaymentService:BaseUrl is not configured"));
-    // No timeout set on purpose: HttpClient falls back to its 100-second default.
-    // Experiment 2 shows what that means when Payment becomes slow.
-});
+    // HttpClient.Timeout keeps its 100-second default. It is only a last-resort safety net now,
+    // because the resilience pipeline below cancels the call much earlier.
+})
+    .AddResilienceHandler("payment", (pipeline, context) =>
+    {
+        var logger = context.ServiceProvider.GetRequiredService<ILoggerFactory>().CreateLogger("PaymentResilience");
+
+        // Strategies run outer to inner in the order they are added.
+
+        // 1. Total timeout: caps all attempts plus the delays between them.
+        pipeline.AddTimeout(totalTimeout);
+
+        // 2. Retry: by default handles HttpRequestException, TimeoutRejectedException, 408, 429 and 5xx.
+        //    422 (declined) is a business answer and is never retried.
+        //    WARNING: POST /payments is not idempotent. Production code would call DisableForUnsafeHttpMethods()
+        //    or send an idempotency key. Experiment 3 shows why.
+        pipeline.AddRetry(new HttpRetryStrategyOptions
+        {
+            MaxRetryAttempts = 2,
+            Delay = TimeSpan.FromMilliseconds(200),
+            BackoffType = DelayBackoffType.Exponential,
+            UseJitter = true, // spreads retries so many clients don't hit a recovering service at the same moment
+            OnRetry = args =>
+            {
+                var reason = args.Outcome.Exception?.GetType().Name
+                    ?? $"HTTP {(int?)args.Outcome.Result?.StatusCode}";
+                logger.LogWarning("Retrying Payment call: retry {RetryNumber} in {DelayMs:F0} ms, reason {Reason}",
+                    args.AttemptNumber + 1, args.RetryDelay.TotalMilliseconds, reason);
+                return default;
+            }
+        });
+
+        // 3. Attempt timeout: each single try gets 2 s, so a timed-out attempt can be retried.
+        pipeline.AddTimeout(attemptTimeout);
+    });
 
 builder.Services.AddScoped<CheckoutHandler>();
 

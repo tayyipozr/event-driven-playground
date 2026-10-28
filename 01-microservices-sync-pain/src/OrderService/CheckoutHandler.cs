@@ -1,5 +1,6 @@
 using System.Net;
 using Microsoft.Extensions.Options;
+using Polly.Timeout;
 
 namespace OrderService;
 
@@ -133,9 +134,11 @@ public class CheckoutHandler(
         new(order.Status == OrderStatus.Paid ? CheckoutOutcome.Paid : CheckoutOutcome.Declined, order, OrderSaved: true);
 
     // HttpRequestException: connection refused, DNS failure, or a non-success status thrown by PaymentClient.
-    // TaskCanceledException while the client is still connected: HttpClient.Timeout expired.
+    // TaskCanceledException while the client is still connected: HttpClient.Timeout (100 s safety net) expired.
+    // TimeoutRejectedException: the Polly timeout in the resilience pipeline fired. It does NOT derive from
+    // OperationCanceledException, so without this case it would escape the catch block and become a 500.
     private static bool IsTechnicalFailure(Exception ex, CancellationToken ct) =>
-        !ct.IsCancellationRequested && ex is HttpRequestException or TaskCanceledException;
+        !ct.IsCancellationRequested && ex is HttpRequestException or TaskCanceledException or TimeoutRejectedException;
 }
 
 public enum PaymentResult
