@@ -1,5 +1,6 @@
 using System.Net;
 using Microsoft.Extensions.Options;
+using Polly.CircuitBreaker;
 using Polly.Timeout;
 
 namespace OrderService;
@@ -137,8 +138,11 @@ public class CheckoutHandler(
     // TaskCanceledException while the client is still connected: HttpClient.Timeout (100 s safety net) expired.
     // TimeoutRejectedException: the Polly timeout in the resilience pipeline fired. It does NOT derive from
     // OperationCanceledException, so without this case it would escape the catch block and become a 500.
+    // BrokenCircuitException: the circuit breaker is open and the call was never sent to Payment.
+    // Without this case an open circuit would surface as an empty 500 instead of a 503.
     private static bool IsTechnicalFailure(Exception ex, CancellationToken ct) =>
-        !ct.IsCancellationRequested && ex is HttpRequestException or TaskCanceledException or TimeoutRejectedException;
+        !ct.IsCancellationRequested
+        && ex is HttpRequestException or TaskCanceledException or TimeoutRejectedException or BrokenCircuitException;
 }
 
 public enum PaymentResult

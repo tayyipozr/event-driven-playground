@@ -28,6 +28,7 @@ builder.Services.AddHttpClient<PaymentClient>(client =>
         var logger = context.ServiceProvider.GetRequiredService<ILoggerFactory>().CreateLogger("PaymentResilience");
 
         // Strategies run outer to inner in the order they are added.
+        // Same order as AddStandardResilienceHandler(): total timeout -> retry -> circuit breaker -> attempt timeout.
 
         // 1. Total timeout: caps all attempts plus the delays between them.
         pipeline.AddTimeout(totalTimeout);
@@ -45,15 +46,42 @@ builder.Services.AddHttpClient<PaymentClient>(client =>
             UseJitter = true, // spreads retries so many clients don't hit a recovering service at the same moment
             OnRetry = args =>
             {
-                var reason = args.Outcome.Exception?.GetType().Name
-                    ?? $"HTTP {(int?)args.Outcome.Result?.StatusCode}";
                 logger.LogWarning("Retrying Payment call: retry {RetryNumber} in {DelayMs:F0} ms, reason {Reason}",
-                    args.AttemptNumber + 1, args.RetryDelay.TotalMilliseconds, reason);
+                    args.AttemptNumber + 1, args.RetryDelay.TotalMilliseconds, Describe(args.Outcome));
                 return default;
             }
         });
 
-        // 3. Attempt timeout: each single try gets 2 s, so a timed-out attempt can be retried.
+        // 3. Circuit breaker: inside the retry, so every single attempt is counted.
+        //    When open, calls fail in milliseconds with BrokenCircuitException and never reach Payment.
+        //    The state lives in this process only: each Order replica would have its own breaker.
+        //    Demo values. Production values come from real traffic (standard handler: 0.1 / 100 / 30 s / 5 s).
+        pipeline.AddCircuitBreaker(new HttpCircuitBreakerStrategyOptions
+        {
+            FailureRatio = 0.5,                          // open when at least half of the attempts fail...
+            MinimumThroughput = 4,                       // ...and at least 4 attempts were seen...
+            SamplingDuration = TimeSpan.FromSeconds(10), // ...within the last 10 seconds
+            BreakDuration = TimeSpan.FromSeconds(15),    // stay open long enough to observe it by hand
+            OnOpened = args =>
+            {
+                logger.LogWarning("Circuit OPENED for {BreakSeconds:F0} s, last outcome {Outcome}",
+                    args.BreakDuration.TotalSeconds, Describe(args.Outcome));
+                return default;
+            },
+            OnHalfOpened = _ =>
+            {
+                logger.LogWarning("Circuit HALF-OPEN: the next call is a trial");
+                return default;
+            },
+            OnClosed = _ =>
+            {
+                logger.LogWarning("Circuit CLOSED: calls to Payment flow again");
+                return default;
+            }
+        });
+
+        // 4. Attempt timeout: each single try gets 2 s, so a timed-out attempt can be retried
+        //    and also counts as a failure for the circuit breaker.
         pipeline.AddTimeout(attemptTimeout);
     });
 
@@ -105,6 +133,10 @@ app.MapGet("/orders/{id:guid}", async (Guid id, OrdersDbContext db, Cancellation
         : Results.NotFound());
 
 app.Run();
+
+// Short description of an attempt result for logs: exception type or HTTP status code.
+static string Describe(Outcome<HttpResponseMessage> outcome) =>
+    outcome.Exception?.GetType().Name ?? $"HTTP {(int?)outcome.Result?.StatusCode}";
 
 // "status" is reserved by ProblemDetails (RFC 9457) for the HTTP status code,
 // so the order status gets its own key.
