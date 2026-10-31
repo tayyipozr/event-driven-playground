@@ -1,4 +1,6 @@
+using Microsoft.AspNetCore.Mvc;
 using Microsoft.EntityFrameworkCore;
+using Npgsql;
 using PaymentService;
 
 const decimal DeclineAbove = 1000m;
@@ -20,19 +22,39 @@ using (var scope = app.Services.CreateScope())
 
 // HttpContext.RequestAborted is deliberately NOT used in this handler.
 // Like a real payment provider, the server finishes the charge even if the caller has already given up.
-app.MapPost("/payments", async (CreatePaymentRequest request, PaymentsDbContext db, ChaosSettings chaos, ILogger<Program> logger) =>
+app.MapPost("/payments", async (
+    CreatePaymentRequest request,
+    [FromHeader(Name = "Idempotency-Key")] string? idempotencyKey,
+    PaymentsDbContext db,
+    ChaosSettings chaos,
+    ILogger<Program> logger) =>
 {
+    // Malformed requests are rejected first. They never reach chaos or the database.
+    if (string.IsNullOrWhiteSpace(idempotencyKey) || idempotencyKey.Length > Payment.IdempotencyKeyMaxLength)
+    {
+        return Results.Problem(
+            statusCode: StatusCodes.Status400BadRequest,
+            title: $"The Idempotency-Key header is required (max {Payment.IdempotencyKeyMaxLength} characters)");
+    }
+
+    if (request.Amount <= 0)
+    {
+        return Results.Problem(statusCode: StatusCodes.Status400BadRequest, title: "Amount must be positive");
+    }
+
+    // The column is numeric(18,2). Without this check PostgreSQL would round 250.555 to 250.56,
+    // and an honest retry of the same request would later look like a different amount (409).
+    if (decimal.Round(request.Amount, 2) != request.Amount)
+    {
+        return Results.Problem(statusCode: StatusCodes.Status400BadRequest, title: "Amount can have at most 2 decimal places");
+    }
+
     var config = chaos.Current;
 
     if (Random.Shared.NextDouble() < config.FailureRate)
     {
         logger.LogWarning("Chaos: simulated failure for order {OrderId}", request.OrderId);
         return Results.Problem(statusCode: StatusCodes.Status500InternalServerError, title: "Simulated failure");
-    }
-
-    if (request.Amount <= 0)
-    {
-        return Results.Problem(statusCode: StatusCodes.Status400BadRequest, title: "Amount must be positive");
     }
 
     if (request.Amount > DeclineAbove)
@@ -49,10 +71,44 @@ app.MapPost("/payments", async (CreatePaymentRequest request, PaymentsDbContext 
         Id = Guid.NewGuid(),
         OrderId = request.OrderId,
         Amount = request.Amount,
-        CreatedAtUtc = DateTime.UtcNow
+        CreatedAtUtc = DateTime.UtcNow,
+        IdempotencyKey = idempotencyKey
     };
     db.Payments.Add(payment);
-    await db.SaveChangesAsync();
+
+    try
+    {
+        await db.SaveChangesAsync();
+    }
+    catch (DbUpdateException ex) when (ex.InnerException is PostgresException
+    {
+        SqlState: PostgresErrorCodes.UniqueViolation,
+        ConstraintName: Payment.IdempotencyKeyIndex
+    })
+    {
+        // This key was used before, either by an earlier attempt or by a concurrent request that won the race.
+        // The failed entity is still tracked as Added. Clear it so no later SaveChanges retries the insert.
+        db.ChangeTracker.Clear();
+
+        var existing = await db.Payments.AsNoTracking().SingleAsync(p => p.IdempotencyKey == idempotencyKey);
+
+        // Same key with a different payload is a client bug, not a retry.
+        // 409 instead of 422: in this API 422 already means "declined", and Order would misread it.
+        if (existing.OrderId != request.OrderId || existing.Amount != request.Amount)
+        {
+            logger.LogWarning("Idempotency key {IdempotencyKey} reused with a different payload", idempotencyKey);
+            return Results.Problem(
+                statusCode: StatusCodes.Status409Conflict,
+                title: "Idempotency key reused with a different request",
+                detail: "Use a new key for a new payment.");
+        }
+
+        // Replay: no new charge and no chaos delay. The caller gets the original result immediately.
+        logger.LogInformation("Replay: payment {PaymentId} for order {OrderId} returned for idempotency key {IdempotencyKey}",
+            existing.Id, existing.OrderId, idempotencyKey);
+        return Results.Ok(new PaymentResponse(existing.Id, existing.OrderId, existing.Amount));
+    }
+
     logger.LogInformation("Payment {PaymentId} captured for order {OrderId}", payment.Id, payment.OrderId);
 
     // The delay comes AFTER the commit: the money is already taken, only the response is late.

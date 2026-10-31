@@ -34,8 +34,9 @@ builder.Services.AddHttpClient<PaymentClient>(client =>
 
         // 2. Retry: by default handles HttpRequestException, TimeoutRejectedException, 408, 429 and 5xx.
         //    422 (declined) is a business answer and is never retried.
-        //    WARNING: POST /payments is not idempotent. Production code would call DisableForUnsafeHttpMethods()
-        //    or send an idempotency key. Experiment 3 shows why.
+        //    Retrying POST /payments is safe only because PaymentClient sends an Idempotency-Key (the order id).
+        //    Without the key, a timed-out attempt that already charged would be charged again (experiment 3).
+        //    Without an idempotency key, production code would call DisableForUnsafeHttpMethods().
         pipeline.AddRetry(new HttpRetryStrategyOptions
         {
             MaxRetryAttempts = 2,

@@ -150,10 +150,24 @@ public enum PaymentResult
 // Typed HttpClient. The only way Order talks to Payment.
 public class PaymentClient(HttpClient http)
 {
+    public const string IdempotencyKeyHeader = "Idempotency-Key";
+
     public async Task<PaymentResult> ChargeAsync(Guid orderId, decimal amount, CancellationToken ct)
     {
-        using var response = await http.PostAsJsonAsync("/payments", new ChargeRequest(orderId, amount), ct);
+        using var request = new HttpRequestMessage(HttpMethod.Post, "/payments")
+        {
+            Content = JsonContent.Create(new ChargeRequest(orderId, amount))
+        };
 
+        // One key per business operation: the order id, not a new Guid per attempt.
+        // The header is set here, before the request enters the resilience pipeline,
+        // so every retry carries the same key and Payment can recognize a repeated request.
+        // The same key also protects a later recovery job that retries this order (modules 07 and 08).
+        request.Headers.Add(IdempotencyKeyHeader, orderId.ToString());
+
+        using var response = await http.SendAsync(request, ct);
+
+        // 201 (new charge) and 200 (replay of an earlier charge) both mean the money was taken once.
         if (response.IsSuccessStatusCode)
         {
             return PaymentResult.Captured;
@@ -165,6 +179,7 @@ public class PaymentClient(HttpClient http)
             return PaymentResult.Declined;
         }
 
+        // 400 and 409 are contract bugs on our side. They still end up as a 503 here (known limitation, see README).
         throw new HttpRequestException($"Payment service returned {(int)response.StatusCode}", inner: null, response.StatusCode);
     }
 
